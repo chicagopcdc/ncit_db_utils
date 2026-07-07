@@ -14,11 +14,11 @@ import sqlite3
 start_time = datetime.datetime.now()
 evs_headers = {"Content-Type": "application/json"}
 parser = argparse.ArgumentParser()
-print(os.environ)
+#print(os.environ)
 # These could be moved to environment variables.
 
 # Expected arguments
-
+parser.add_argument('--duckdb_file', action='store', type=str, required=False)
 parser.add_argument('--dbname', action='store', type=str, required=False)
 parser.add_argument('--host', action='store', type=str, required=False)
 parser.add_argument('--port', action='store', type=int, required=False)
@@ -37,9 +37,17 @@ args = parser.parse_args()
 if args.file is not None:
     connection_string = f'sqlite:///{args.file}'
     print("connecting to sqlite database")
-else:
+elif args.duckdb_file is not None:
+    import duckdb
+    connection_string = f'duckdb:///{args.duckdb_file}'
+    print("Connecting to DuckDB")    
+elif args.dbname is not None:
     print("connecting to Postgresql database")
     connection_string = f'postgresql+psycopg://{args.user}:{os.getenv('db_password')}@{args.host}:{args.port}/{args.dbname}'
+else:
+    print("no database connection info specified, bailing out.")
+    sys.exit()
+
 sae = sqlalchemy.create_engine(connection_string)
 sae_connection = sae.connect()
 sa_inspector = sqlalchemy.inspect(sae)
@@ -49,26 +57,47 @@ cur = con.cursor()
 # get the list of table names in the db (used to see if this db has the version table or not).
 tables_in_db = sa_inspector.get_table_names()
 
-def get_concept_info(conceptlist : list, include: str):
+def get_concept_info(conceptlist : list, include: str, request_limit=500):
     """ return a set of concepts from EVS with their synonyms """
 
     url= f'https://api-evsrest.nci.nih.gov/api/v1/concept/ncit'
-    request_limit = 500
+    retrieved_records = 0
+    retry_count = 2
+    sleep_time = 1
+    backoff_increment = 3
+    timeouts = 0
+
 
     res_list = []
+    keep_going = True
 
     s = 0
-    while s < len(conceptlist):
+    while s < len(conceptlist) and keep_going:
         chunk = conceptlist[s:s + request_limit]
         url_vars = {'include': include, 'list': chunk}
-        r = requests.get(url, timeout=(0.4, 7.0), headers=evs_headers, params=url_vars)
-        j = r.json()
-        print (".")
-        if r.status_code != 200:
+        try:
+            r = requests.get(url, timeout=(0.4, 7.0), headers=evs_headers, params=url_vars)
             r.raise_for_status()
-            return None
-        res_list = res_list + j
-        s = s + len(j)
+
+            j = r.json()
+            res_list = res_list + j
+            s = s + len(j)
+        except requests.exceptions.HTTPError as http_err:
+            print(f"HTTP error occurred: {http_err}")
+            time.sleep(sleep_time + timeouts*backoff_increment)
+            timeouts += 1
+            if timeouts > retry_count:
+                print("bailing out on concept info -- problems with EVS or networking or code")
+                sys.exit()
+        except Exception as err:
+            print(f"Other error occurred: {err}")
+
+            time.sleep(sleep_time+timeouts*backoff_increment)
+            timeouts += 1
+            if timeouts > retry_count:
+                print("bailing out on concept info  -- problems with EVS or networking or code")
+                sys.exit()
+
 
     return res_list
 
@@ -123,9 +152,43 @@ def get_ncit_from_evs_api():
     """get the current evs from the api in case the flat file is not available"""
     pass
 
+def divide_list(input_list, chunk_size):
+    """Divide a list into smaller lists of a specified size."""
+    return [input_list[i:i + chunk_size] for i in range(0, len(input_list), chunk_size)]
+
 def get_full_synonyms_from_evs_api():
     """Get the full set of attributes for all synonyms from EVS."""
-    pass
+
+#    stuff = get_concept_info(['C194732'], 'synonyms')
+    dataframe_data = {
+        'code': pd.Series(dtype='str'),
+        'name': pd.Series(dtype='str'),
+        'source': pd.Series(dtype='str'),
+        'subSource': pd.Series(dtype='str'),
+        'termType': pd.Series(dtype='str'),
+        'type': pd.Series(dtype='str')
+    }
+    full_synonym_df = pd.DataFrame(data=dataframe_data)
+    cur = con.cursor()
+    cur.execute("select code from ncit")
+    rs = cur.fetchall()
+    concept_list = [r[0] for r in rs]
+    chunks = divide_list(concept_list, 500)
+    chunk_count = 0
+    for chunk in chunks:
+        chunk_count += 1
+        print("get full synonyms - processing chunk", chunk_count, "of", len(chunks))
+        syns_from_evs = get_concept_info(chunk,'synonyms')
+        for c in syns_from_evs:
+            if 'synonyms' in c:
+                syn_info = c['synonyms']
+                new_df = pd.json_normalize(syn_info)
+                new_df['code'] = c['code']
+                full_synonym_df = pd.concat([full_synonym_df, new_df], ignore_index=True)
+
+    full_synonym_df.to_sql('full_synonyms', con=sae_connection, if_exists='replace', index=False)
+    print('.')
+
 
 def get_named_association(association_name: str):
     dataframe_data = {
@@ -197,6 +260,9 @@ def get_named_association(association_name: str):
                 sys.exit()
     association_df.columns = ['association', 'code', 'name', 'related_code', 'related_name']
     return association_df
+
+
+
 
 
 
@@ -298,6 +364,29 @@ cur.execute("drop index if exists par_par_idx")
 cur.execute("create index par_par_idx on parents(parent)")
 
 con.commit()
+#get_full_synonyms_from_evs_api()  This is really slow from the EVS API
+
+syns_df = ncit_df[['code', 'synonyms']].dropna(subset=['synonyms']).copy()
+
+
+syn_expanded = syns_df['synonyms'].str.split('|', expand=True).stack().reset_index(level=1, drop=True)
+syn_expanded.name = 'synonym'
+syn_df = syns_df.join(syn_expanded).reset_index(drop=True)
+
+
+syn_df.drop(columns=['synonyms'], inplace=True)
+print('writing synonym dataframe to db')
+syn_df.to_sql('synonyms', con=sae_connection, if_exists='replace', index=False)
+sae_connection.commit()
+# Delete the pref names from the synonyms table
+
+cur.execute("delete from synonyms  where exists (select ncit.code from ncit  where synonyms.code = ncit.code and ncit.pref_name =  synonyms.synonym)")
+cur.execute("drop index if exists synonym_code_index")
+cur.execute("create index synonym_code_index on synonyms(code)")
+cur.execute("drop index if exists synonym_syn_index")
+cur.execute("create index synonym_syn_index on synonyms(synonym)")
+sae_connection.commit()
+
 
 print('Creating enumerated path table')
 cur.execute("drop table if exists ncit_tc_with_path")
@@ -395,7 +484,7 @@ mcode_targets = get_concept_info(mcode_concept_list, 'synonyms')
 
 mcode_df_list = []
 for m in mcode_targets:
-    print('procesing ', m)
+   # print('procesing ', m)
     for s in m['synonyms']:
         if 'source' in s and s['source'] == 'mCode' and 'subSource' in s:
             row = [m['code'], m['name'], s['subSource'],s['code'], s['name'], s['termType'], s['type']]
