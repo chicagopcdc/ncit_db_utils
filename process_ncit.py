@@ -14,7 +14,7 @@ import sqlite3
 start_time = datetime.datetime.now()
 evs_headers = {"Content-Type": "application/json"}
 parser = argparse.ArgumentParser()
-print(os.environ)
+#print(os.environ)
 # These could be moved to environment variables.
 
 # Expected arguments
@@ -47,7 +47,7 @@ elif args.dbname is not None:
 else:
     print("no database connection info specified, bailing out.")
     sys.exit()
-    
+
 sae = sqlalchemy.create_engine(connection_string)
 sae_connection = sae.connect()
 sa_inspector = sqlalchemy.inspect(sae)
