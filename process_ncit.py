@@ -280,7 +280,7 @@ ncit_version = j[0]['version']
 print("ncit_version", ncit_version)
 
 if 'ncit_version' not in tables_in_db:
-    if file is None:
+    if sqlite_file is None:
         cur.execute("create table ncit_version(version varchar(20), process_date timestamp)")
     else:
         cur.execute("create table ncit_version(version varchar(20), process_date text)")
@@ -472,7 +472,7 @@ print('noting ncit version number and wrapping up')
 cur.execute('delete from ncit_version')
 con.commit()
 update_version_sql = sqlalchemy.sql.text("insert into ncit_version (version, process_date) values (:version, :process_date)")
-if file is None:
+if sqlite_file is None:
     parm_dict = {"version": ncit_version, "process_date": datetime.datetime.now()}
 else:
     parm_dict = {"version": ncit_version, "process_date": datetime.datetime.now().isoformat()}
