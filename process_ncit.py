@@ -1,49 +1,56 @@
 import sys
 import pandas as pd
 import zipfile
-import psycopg
-import argparse
+
+from dotenv import load_dotenv
 import sqlalchemy
 import os
 import datetime
 import requests
 import tempfile
 import time
-import sqlite3
+
 
 start_time = datetime.datetime.now()
 evs_headers = {"Content-Type": "application/json"}
-parser = argparse.ArgumentParser()
-#print(os.environ)
-# These could be moved to environment variables.
 
-# Expected arguments
-parser.add_argument('--duckdb_file', action='store', type=str, required=False)
-parser.add_argument('--dbname', action='store', type=str, required=False)
-parser.add_argument('--host', action='store', type=str, required=False)
-parser.add_argument('--port', action='store', type=int, required=False)
-parser.add_argument('--user', action='store', type=str, required=False)
-parser.add_argument('--schema', action='store', type=str, required=False)
-parser.add_argument('--file',action='store', type=str, required=False, help="If a file name is specified, the script will write to a sqlite database")
-args = parser.parse_args()
+load_dotenv()
 
-#fdconnection_string = f'postgresql+psycopg://{os.getenv('db_user')}:{os.getenv('db_password')}@{os.getenv('db_host')}:{os.getenv('db_port')}/{os.getenv('db_name')}'
+# Configuration is read from environment variables (e.g. via a .env file):
+#   sqlite_file - if set, write to a sqlite database at this path
+#   duckdb_file - if set, write to a DuckDB database at this path
+#   dbname      - if set, connect to Postgresql (with host/port/user/schema)
+#   host, port, user, schema - Postgresql connection info
+#   db_password - Postgresql password
+#   ncit_file_name - if set, read the NCIt FLAT.zip archive from this local
+#                    path instead of downloading it from the EVS FTP endpoint
+
+sqlite_file = os.getenv('sqlite_file')
+duckdb_file = os.getenv('duckdb_file')
+dbname = os.getenv('dbname')
+host = os.getenv('host')
+port = os.getenv('port')
+user = os.getenv('user')
+schema = os.getenv('schema')
+ncit_file_name = os.getenv('ncit_file_name')
 
 #
 # If the file name is specified, use sqlite3, otherwise, use Postgresql
 # Need to add in Postgresql schema support
 #
 
-if args.file is not None:
-    connection_string = f'sqlite:///{args.file}'
+if sqlite_file is not None:
+    import sqlite3
+    connection_string = f'sqlite:///{sqlite_file}'
     print("connecting to sqlite database")
-elif args.duckdb_file is not None:
+elif duckdb_file is not None:
     import duckdb
-    connection_string = f'duckdb:///{args.duckdb_file}'
-    print("Connecting to DuckDB")    
-elif args.dbname is not None:
+    connection_string = f'duckdb:///{duckdb_file}'
+    print("Connecting to DuckDB")
+elif dbname is not None:
+    import psycopg
     print("connecting to Postgresql database")
-    connection_string = f'postgresql+psycopg://{args.user}:{os.getenv('db_password')}@{args.host}:{args.port}/{args.dbname}'
+    connection_string = f'postgresql+psycopg://{user}:{os.getenv('db_password')}@{host}:{port}/{dbname}'
 else:
     print("no database connection info specified, bailing out.")
     sys.exit()
@@ -273,7 +280,7 @@ ncit_version = j[0]['version']
 print("ncit_version", ncit_version)
 
 if 'ncit_version' not in tables_in_db:
-    if args.file is None:
+    if file is None:
         cur.execute("create table ncit_version(version varchar(20), process_date timestamp)")
     else:
         cur.execute("create table ncit_version(version varchar(20), process_date text)")
@@ -295,23 +302,34 @@ else:
 #
 
 print("processing ncit_version", ncit_version)
-ncit_url = f'https://evs.nci.nih.gov/ftp1/NCI_Thesaurus/Thesaurus_{ncit_version}.FLAT.zip'
 
-ncit_filename = f'Thesaurus_{ncit_version}.FLAT.zip'
-print('ncit_url=', ncit_url)
+if ncit_file_name is not None:
+    #
+    # Read the thesaurus from a local FLAT.zip archive, skipping the
+    # download. The file is expected to be the same Thesaurus_<version>.FLAT.zip
+    # format published by EVS, containing a tab-delimited Thesaurus.txt.
+    #
+    print('reading local ncit file:', ncit_file_name)
+    arch = zipfile.ZipFile(ncit_file_name, mode='r')
+    thesaurus_file = arch.open('Thesaurus.txt', mode='r')
+    f = None
+else:
+    ncit_url = f'https://evs.nci.nih.gov/ftp1/NCI_Thesaurus/Thesaurus_{ncit_version}.FLAT.zip'
 
-f = tempfile.NamedTemporaryFile(suffix = ncit_filename)
-with requests.get(ncit_url, stream=True,timeout = (0.4, 7.0), headers = evs_headers) as r:
-    if r.status_code == requests.codes.ok:
-        for chunk in r.iter_content(chunk_size=5000000):
-            f.write(chunk)
-    else:
-        r.raise_for_status()
+    ncit_filename = f'Thesaurus_{ncit_version}.FLAT.zip'
+    print('ncit_url=', ncit_url)
 
+    f = tempfile.NamedTemporaryFile(suffix = ncit_filename)
+    with requests.get(ncit_url, stream=True,timeout = (0.4, 7.0), headers = evs_headers) as r:
+        if r.status_code == requests.codes.ok:
+            for chunk in r.iter_content(chunk_size=5000000):
+                f.write(chunk)
+        else:
+            r.raise_for_status()
 
-thesaurus_file_zip = f.name
-arch = zipfile.ZipFile(thesaurus_file_zip, mode='r')
-thesaurus_file = arch.open('Thesaurus.txt', mode='r')
+    thesaurus_file_zip = f.name
+    arch = zipfile.ZipFile(thesaurus_file_zip, mode='r')
+    thesaurus_file = arch.open('Thesaurus.txt', mode='r')
 
 ncit_df = pd.read_csv(thesaurus_file, delimiter = '\t', header = None,
                          names=('code', 'url', 'parents','synonyms',
@@ -322,7 +340,8 @@ ncit_df['pref_name'] = ncit_df.apply(
     lambda row: row['synonyms'].split('|')[0] , axis = 1
 )
 
-f.close()
+if f is not None:
+    f.close()
 
 print(ncit_df)
 
@@ -453,7 +472,7 @@ print('noting ncit version number and wrapping up')
 cur.execute('delete from ncit_version')
 con.commit()
 update_version_sql = sqlalchemy.sql.text("insert into ncit_version (version, process_date) values (:version, :process_date)")
-if args.file is None:
+if file is None:
     parm_dict = {"version": ncit_version, "process_date": datetime.datetime.now()}
 else:
     parm_dict = {"version": ncit_version, "process_date": datetime.datetime.now().isoformat()}
