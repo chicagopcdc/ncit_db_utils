@@ -55,7 +55,12 @@ else:
     print("no database connection info specified, bailing out.")
     sys.exit()
 
-sae = sqlalchemy.create_engine(connection_string)
+if schema is not None and schema != '':
+    sae = sqlalchemy.create_engine(connection_string,
+    connect_args={"options": f"-csearch_path={schema}"})
+else:
+    sae = sqlalchemy.create_engine(connection_string)
+
 sae_connection = sae.connect()
 sa_inspector = sqlalchemy.inspect(sae)
 con = sae.raw_connection()
