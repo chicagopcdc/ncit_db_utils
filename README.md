@@ -7,7 +7,7 @@
 On each run the script:
 
 1. **Checks the current NCIt version.** Queries the NCI EVS REST API for the version of a sentinel concept (`C2991`) to determine the latest published release. If the target database already holds that version (per the `ncit_version` table), it exits without doing any work.
-2. **Downloads the NCIt flat file.** Fetches `Thesaurus_<version>.FLAT.zip` from the EVS FTP endpoint, extracts `Thesaurus.txt`, and loads it into the `ncit` table.
+2. **Obtains the NCIt flat file.** If `ncit_file_name` is set, reads that local `Thesaurus_<version>.FLAT.zip` archive; otherwise fetches `Thesaurus_<version>.FLAT.zip` from the EVS FTP endpoint. Either way it extracts `Thesaurus.txt` and loads it into the `ncit` table.
 3. **Builds the parent/child edge table.** Explodes the pipe-delimited `parents` field into one row per edge in the `parents` table.
 4. **Builds the synonyms table.** Explodes the pipe-delimited `synonyms` field into the `synonyms` table, dropping entries that duplicate a concept's preferred name.
 5. **Enumerates all hierarchy paths.** Uses a recursive CTE over `parents` to build `ncit_tc_with_path`, which contains every ancestor→descendant path with its level and full pipe-delimited path string.
@@ -18,7 +18,7 @@ On each run the script:
 ## Requirements
 
 - Python 3.12+ (the script uses f-strings containing quotes, which require 3.12+)
-- Python packages: `pandas`, `sqlalchemy`, `requests`, plus a driver for your target database:
+- Python packages: `pandas`, `sqlalchemy`, `requests`, `python-dotenv`, plus a driver for your target database:
   - PostgreSQL: `psycopg` (v3)
   - DuckDB: `duckdb`
   - SQLite: bundled with Python (`sqlite3`)
@@ -28,47 +28,69 @@ On each run the script:
 
 ## Database targets
 
-The script writes to exactly one of three backends, selected by which argument you pass. It picks the backend in this order of precedence: `--file` (SQLite), then `--duckdb_file` (DuckDB), then `--dbname` (PostgreSQL). If none is supplied it exits.
+The script writes to exactly one of three backends, selected by which environment variable is set. It picks the backend in this order of precedence: `sqlite_file` (SQLite), then `duckdb_file` (DuckDB), then `dbname` (PostgreSQL). If none is set it exits.
+
+Configuration is read from the environment, loaded from a `.env` file in the working directory via [python-dotenv](https://pypi.org/project/python-dotenv/). Copy `.env.example` to `.env` and set the variables for the backend you want, then run:
+
+```bash
+python process_ncit.py
+```
+
+There are no command-line arguments.
 
 ### SQLite
 
-```bash
-python process_ncit.py --file ncit.sqlite
+```dotenv
+# .env
+sqlite_file=ncit.sqlite
 ```
 
 ### DuckDB
 
-```bash
-python process_ncit.py --duckdb_file ncit.duckdb
+```dotenv
+# .env
+duckdb_file=ncit.duckdb
 ```
 
 ### PostgreSQL
 
-```bash
-export db_password='...'   # read from the environment, not passed on the command line
-python process_ncit.py \
-  --dbname ncit \
-  --host db.example.org \
-  --port 5432 \
-  --user ncit_writer \
-  --schema public
+```dotenv
+# .env
+dbname=ncit
+host=db.example.org
+port=5432
+user=ncit_writer
+schema=public
+db_password=...
 ```
 
-## Arguments
+### Using a local flat file
 
-| Argument | Backend | Description |
+By default the script downloads the flat file from EVS. To load from a local archive instead (for offline runs or to pin a specific export), set `ncit_file_name` to a `Thesaurus_<version>.FLAT.zip` file alongside your chosen backend:
+
+```dotenv
+# .env
+sqlite_file=ncit.sqlite
+ncit_file_name=/data/Thesaurus_24.12e.FLAT.zip
+```
+
+The version check still runs against EVS, so a local file is only loaded when the target database is behind the current published version.
+
+## Configuration
+
+All settings are read from environment variables (typically via a `.env` file).
+
+| Variable | Backend | Description |
 |----------|---------|-------------|
-| `--file` | SQLite | Path to a SQLite database file. If set, SQLite is used. |
-| `--duckdb_file` | DuckDB | Path to a DuckDB database file. |
-| `--dbname` | PostgreSQL | Database name. |
-| `--host` | PostgreSQL | Database host. |
-| `--port` | PostgreSQL | Database port. |
-| `--user` | PostgreSQL | Database user. |
-| `--schema` | PostgreSQL | Schema name. |
-
-### Environment variables
-
-- `db_password` — PostgreSQL password. The password is read from the environment only; it is never accepted as a command-line argument.
+| `sqlite_file` | SQLite | Path to a SQLite database file. If set, SQLite is used. |
+| `duckdb_file` | DuckDB | Path to a DuckDB database file. |
+| `dbname` | PostgreSQL | Database name. |
+| `host` | PostgreSQL | Database host. |
+| `port` | PostgreSQL | Database port. |
+| `user` | PostgreSQL | Database user. |
+| `schema` | PostgreSQL | Schema name. |
+| `db_password` | PostgreSQL | Database password. |
+| `ncit_file_name` | (any) | Optional. Path to a local `Thesaurus_<version>.FLAT.zip` archive. If set, the flat file is read from here instead of downloading it from EVS. |
 
 ## Output tables
 
