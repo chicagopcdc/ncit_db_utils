@@ -14,7 +14,7 @@ python-dotenv==1.2.2
 pytz==2024.2
 requests==2.32.3
 six==1.17.0
-SQLAlchemy==2.0.37
+SQLAlchemy>=2.0.52
 typing_extensions==4.12.2
 tzdata==2024.2
 urllib3==2.3.0
