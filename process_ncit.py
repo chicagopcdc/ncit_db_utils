@@ -24,6 +24,15 @@ load_dotenv()
 #   db_password - Postgresql password
 #   ncit_file_name - if set, read the NCIt FLAT.zip archive from this local
 #                    path instead of downloading it from the EVS FTP endpoint
+#   local_ncit_files - optional list of local addendum files, separated by
+#                    os.pathsep (':' on Linux/macOS, ';' on Windows). Each file
+#                    uses the same headerless, tab-delimited 8-column layout as
+#                    Thesaurus.txt (preferred name first in the synonyms field).
+#                    Local codes are merged into the ncit table (with a 'source'
+#                    column naming the file) and flow through parents, synonyms
+#                    and the transitive closure tables. Editing an addendum so
+#                    its mtime is newer than the last process_date triggers a
+#                    rebuild even when the NCIt version is unchanged.
 
 sqlite_file = os.getenv('sqlite_file')
 duckdb_file = os.getenv('duckdb_file')
@@ -33,6 +42,20 @@ port = os.getenv('port')
 user = os.getenv('user')
 schema = os.getenv('schema')
 ncit_file_name = os.getenv('ncit_file_name')
+local_ncit_files = os.getenv('local_ncit_files')
+
+local_file_list = []
+if local_ncit_files:
+    local_file_list = [p.strip() for p in local_ncit_files.split(os.pathsep) if p.strip()]
+    missing = [p for p in local_file_list if not os.path.isfile(p)]
+    if missing:
+        print("local ncit file(s) not found, bailing out:", missing)
+        sys.exit(1)
+
+# Column layout of Thesaurus.txt (and local addendum files). pref_name is not
+# in the file; it is derived from the first synonym after loading.
+thesaurus_columns = ('code', 'url', 'parents', 'synonyms', 'definition',
+                     'display_name', 'concept_status', 'semantic_type', 'pref_name')
 
 #
 # If the file name is specified, use sqlite3, otherwise, use Postgresql
@@ -274,8 +297,76 @@ def get_named_association(association_name: str):
     return association_df
 
 
+def local_files_newer_than(last_processed, paths: list):
+    """Return the local addendum files modified after last_processed."""
+    # sqlite stores process_date as ISO text; Postgresql/DuckDB return a datetime
+    if isinstance(last_processed, str):
+        last_processed = datetime.datetime.fromisoformat(last_processed)
+    # process_date is written as naive local time; normalize tz-aware values to match
+    if last_processed.tzinfo is not None:
+        last_processed = last_processed.astimezone().replace(tzinfo=None)
+    return [p for p in paths
+            if datetime.datetime.fromtimestamp(os.path.getmtime(p)) > last_processed]
 
 
+def load_local_addenda(paths: list, ncit_df: pd.DataFrame):
+    """Read local addendum files and validate them against each other and NCIt.
+
+    Exits on structural problems (missing synonyms, duplicate codes, parents
+    that don't resolve). Prints a warning for terms that also appear in NCIt,
+    since those will be ambiguous to a tokenizer.
+    """
+    frames = []
+    for p in paths:
+        print('reading local ncit addendum:', p)
+        ldf = pd.read_csv(p, delimiter='\t', header=None, names=thesaurus_columns, dtype=str)
+        ldf['source'] = os.path.basename(p)
+        frames.append(ldf)
+    local_df = pd.concat(frames, ignore_index=True)
+
+    errors = []
+
+    no_syn = local_df[local_df['synonyms'].isna() | (local_df['synonyms'].str.strip() == '')]
+    if len(no_syn) > 0:
+        errors.append(f"rows with no synonyms (preferred name must be the first synonym): "
+                      f"{no_syn['code'].tolist()}")
+
+    dup_local = local_df[local_df['code'].duplicated(keep=False)]
+    if len(dup_local) > 0:
+        errors.append(f"codes duplicated within local files: {sorted(set(dup_local['code']))}")
+
+    dup_ncit = local_df[local_df['code'].isin(ncit_df['code'])]
+    if len(dup_ncit) > 0:
+        errors.append(f"local codes that already exist in NCIt: {dup_ncit['code'].tolist()}")
+
+    known_codes = set(ncit_df['code']) | set(local_df['code'])
+    local_parents = local_df[['code', 'parents']].dropna(subset=['parents'])
+    local_parents = local_parents.assign(parent=local_parents['parents'].str.split('|')).explode('parent')
+    unresolved = local_parents[~local_parents['parent'].isin(known_codes)]
+    if len(unresolved) > 0:
+        errors.append("parents that are neither local nor NCIt codes: " +
+                      ', '.join(f"{r.code}->{r.parent}" for r in unresolved.itertuples()))
+
+    if errors:
+        print("problems found in local ncit files, bailing out:")
+        for e in errors:
+            print('  ', e)
+        sys.exit(1)
+
+    # Term collisions with NCIt are allowed, but worth knowing about downstream
+    ncit_terms = set(ncit_df['synonyms'].dropna().str.split('|').explode().str.lower())
+    local_terms = local_df[['code', 'synonyms']].assign(
+        term=local_df['synonyms'].str.split('|')).explode('term')
+    collisions = local_terms[local_terms['term'].str.lower().isin(ncit_terms)]
+    if len(collisions) > 0:
+        print(f"warning: {len(collisions)} local term(s) also appear as NCIt synonyms:")
+        for r in collisions.head(20).itertuples():
+            print(f"   {r.code}: {r.term}")
+        if len(collisions) > 20:
+            print(f"   ... and {len(collisions) - 20} more")
+
+    print(f"loaded {len(local_df)} local concepts from {len(paths)} file(s)")
+    return local_df
 
 
 r = requests.get('https://api-evsrest.nci.nih.gov/api/v1/concept/ncit?include=minimal&list=C2991',
@@ -292,12 +383,15 @@ if 'ncit_version' not in tables_in_db:
 
 con.commit()
 
-version_sql = sqlalchemy.sql.text("select count(*) from ncit_version where version = :version")
+version_sql = sqlalchemy.sql.text("select process_date from ncit_version where version = :version")
 res = sae_connection.execute(version_sql, {"version": ncit_version})
-is_current = res.fetchone()[0]
-if is_current == 1:
-    print("Database version of NCIt is current, exiting.")
-    sys.exit()
+version_row = res.fetchone()
+if version_row is not None:
+    changed_local_files = local_files_newer_than(version_row[0], local_file_list)
+    if not changed_local_files:
+        print("Database version of NCIt is current, exiting.")
+        sys.exit()
+    print("NCIt version is current, but local file(s) changed since last run:", changed_local_files)
 else:
     print("processing new NCIt version", ncit_version)
 
@@ -337,9 +431,15 @@ else:
     thesaurus_file = arch.open('Thesaurus.txt', mode='r')
 
 ncit_df = pd.read_csv(thesaurus_file, delimiter = '\t', header = None,
-                         names=('code', 'url', 'parents','synonyms',
-                                'definition', 'display_name', 'concept_status', 'semantic_type', 'pref_name' )
+                         names=thesaurus_columns
                       )
+ncit_df['source'] = 'NCIt'
+
+# Merge local addenda before pref_name is derived, so local rows get the same
+# treatment and flow through parents, synonyms and the closure tables.
+if local_file_list:
+    local_df = load_local_addenda(local_file_list, ncit_df)
+    ncit_df = pd.concat([ncit_df, local_df], ignore_index=True)
 
 ncit_df['pref_name'] = ncit_df.apply(
     lambda row: row['synonyms'].split('|')[0] , axis = 1
